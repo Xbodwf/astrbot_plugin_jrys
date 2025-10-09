@@ -40,7 +40,7 @@ TEXT_WRAP_WIDTH = 1000
 LEFT_PADDING = 20
 
 
-@register("今日运势", "ominus", "一个今日运势海报生成图", "1.0.0")
+@register("今日运势", "ominus", "一个今日运势海报生成图", "1.0.1")
 class JrysPlugin(Star):
     """今日运势插件,可生成今日运势海报"""
 
@@ -190,6 +190,9 @@ class JrysPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_all_message(self, event: AstrMessageEvent):
+        """
+        输入jrys 今日运势 运势 等关键词后，生成今日运势海报
+        """
         message_str = event.message_str.strip()
         if self.jrys_keyword_enabled:
             if '运势' in message_str or '今日运势' in message_str or 'jrys' in message_str.lower():
