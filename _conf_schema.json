@@ -78,6 +78,12 @@
         "type": "int",
         "hint": "设置注意事项在图片上Y轴的位置，默认为1850 例如:(此运势仅供娱乐参考，请勿过度解读。)",
         "default": 1850
+    },
+    "jrys_keyword_enabled":{
+        "description": "启用关键字触发",
+        "type": "bool",
+        "hint": "启用后，用户可以通过发送特定的关键字例如 jrys 运势 今日运势关键字来触发插件功能。默认打开",
+        "default": true
     }
     
 

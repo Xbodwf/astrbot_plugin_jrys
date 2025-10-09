@@ -75,6 +75,9 @@ class JrysPlugin(Star):
         self.font_dir = os.path.join(self.data_dir, "font")
         self.font_path = os.path.join(self.data_dir, "font", self.font_name)
 
+        # 是否启用关键词触发功能
+        self.jrys_keyword_enabled = self.config.get("jrys_keyword_enabled", True)
+
         # 网络请求部分
         self._http_timeout = aiohttp.ClientTimeout(total=5)  # 设置请求超时时间为5秒
         self._connection_limit = aiohttp.TCPConnector(limit=10)  # 限制并发连接数为10
@@ -183,6 +186,17 @@ class JrysPlugin(Star):
 
                 except Exception as e:
                     logger.warning(f"删除临时文件 {temp_file_path} 失败: {e}")
+
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_all_message(self, event: AstrMessageEvent):
+        message_str = event.message_str.strip()
+        if self.jrys_keyword_enabled:
+            if '运势' in message_str or '今日运势' in message_str or 'jrys' in message_str.lower():
+                async for result in self.jrys(event):
+                    yield result
+
+        
 
     def _generate_image_sync(
         self, avatar_path: str, background_path: str
