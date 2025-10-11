@@ -40,7 +40,7 @@ TEXT_WRAP_WIDTH = 1000
 LEFT_PADDING = 20
 
 
-@register("今日运势", "ominus", "一个今日运势海报生成图", "1.0.1")
+@register("今日运势", "ominus", "一个今日运势海报生成图", "1.0.2")
 class JrysPlugin(Star):
     """今日运势插件,可生成今日运势海报"""
 
