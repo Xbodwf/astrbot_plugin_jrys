@@ -84,6 +84,24 @@
         "type": "bool",
         "hint": "启用后，用户可以通过发送特定的关键字例如 jrys 运势 今日运势关键字来触发插件功能。默认打开",
         "default": true
+    },
+    "pre_cache_background_images":{
+        "description": "加载/重载时预缓存背景图",
+        "type": "bool",
+        "hint": "启用后，插件在加载/重载时会后台预下载 backgroundFolder/*.txt 中的所有图片 URL 到本地缓存目录 （需要 AstrBot >= 4.9.2）。",
+        "default": false
+    },
+    "pre_cache_concurrency":{
+        "description": "预缓存并发数",
+        "type": "int",
+        "hint": "预缓存背景图时的并发下载数量，建议 1-10，默认 3。",
+        "default": 3
+    },
+    "cleanup_background_downloads":{
+        "description": "清理非预缓存模式下的背景图下载",
+        "type": "bool",
+        "hint": "当未启用预缓存背景图时，插件每次运行按需下载的背景图在生成完成后将被删除，默认开启。如需将按需下载也持久化到本地缓存，请关闭该开关。",
+        "default": true
     }
     
 

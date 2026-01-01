@@ -5,7 +5,13 @@ from astrbot.api import AstrBotConfig
 import random
 import json
 import os
+import errno
+import shutil
 import tempfile
+from pathlib import Path
+from hashlib import sha256
+from urllib.parse import urlparse
+from uuid import uuid4
 from typing import Optional, List, Tuple
 from PIL import Image, ImageDraw, ImageFont
 import aiohttp
@@ -84,6 +90,9 @@ class JrysPlugin(Star):
         self._session = aiohttp.ClientSession(
             timeout=self._http_timeout, connector=self._connection_limit
         )
+        self._http_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+        }
 
         self.fonts = {}
         FONT_SIZES = [50, 60, 36, 30]  # 字体大小列表
@@ -106,6 +115,429 @@ class JrysPlugin(Star):
         os.makedirs(self.background_dir, exist_ok=True)
         os.makedirs(self.font_dir, exist_ok=True)
 
+        # 大文件缓存目录（在 initialize() 中初始化为 data/plugin_data/{plugin_name}/...）
+        self._storage_initialized = False
+        self._plugin_data_dir: Optional[Path] = None
+        self._background_cache_dir: Optional[Path] = None
+        self._background_tmp_dir: Optional[Path] = None
+        self._precache_task: Optional[asyncio.Task] = None
+
+    async def initialize(self):
+        """插件加载/重载后执行（适合做缓存预热等异步任务）。"""
+        self._ensure_storage_dirs()
+
+        if self.config.get("pre_cache_background_images", False):
+            self._start_background_precache()
+
+    def _migrate_legacy_cache_dir(self, legacy_dir: Path, target_dir: Path, label: str) -> None:
+        """将旧版本缓存目录迁移到标准插件数据目录。"""
+        try:
+            if not legacy_dir.exists() or not legacy_dir.is_dir():
+                return
+
+            legacy_resolved = legacy_dir.resolve()
+            target_resolved = target_dir.resolve()
+            if legacy_resolved == target_resolved:
+                return
+
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            moved = 0
+            skipped = 0
+            replaced = 0
+            failed = 0
+
+            for item in legacy_dir.iterdir():
+                if not item.is_file():
+                    continue
+
+                dest = target_dir / item.name
+                try:
+                    if dest.exists():
+                        try:
+                            src_stat = item.stat()
+                            dest_stat = dest.stat()
+                            if src_stat.st_mtime <= dest_stat.st_mtime:
+                                item.unlink(missing_ok=True)
+                                skipped += 1
+                                continue
+                        except Exception:
+                            item.unlink(missing_ok=True)
+                            skipped += 1
+                            continue
+
+                        replaced += 1
+
+                    try:
+                        os.replace(item, dest)
+                    except OSError as e:
+                        if e.errno == errno.EXDEV:
+                            shutil.copy2(item, dest)
+                            item.unlink(missing_ok=True)
+                        else:
+                            raise
+
+                    moved += 1
+                except Exception as e:
+                    failed += 1
+                    logger.warning(f"迁移{label}缓存失败: {item} -> {dest} | {e}")
+
+            try:
+                if not any(legacy_dir.iterdir()):
+                    legacy_dir.rmdir()
+            except Exception:
+                pass
+
+            if moved or replaced or skipped or failed:
+                logger.info(
+                    f"{label}缓存迁移完成: "
+                    f"from={legacy_dir} to={target_dir} "
+                    f"moved={moved} replaced={replaced} skipped={skipped} failed={failed}"
+                )
+        except Exception as e:
+            logger.warning(f"{label}缓存迁移异常: {e}")
+
+    def _ensure_storage_dirs(self) -> None:
+        """初始化插件大文件缓存目录（优先 data/plugin_data/{plugin_name}）。"""
+        if self._storage_initialized:
+            return
+
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+            plugin_name = getattr(self, "name", None) or "unknown"
+            data_root = get_astrbot_data_path()
+            data_root_path = data_root if isinstance(data_root, Path) else Path(str(data_root))
+            plugin_data_dir = data_root_path / "plugin_data" / plugin_name
+            plugin_data_dir.mkdir(parents=True, exist_ok=True)
+
+            self._plugin_data_dir = plugin_data_dir
+
+            cache_dir = plugin_data_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            self._background_cache_dir = cache_dir / "background_images"
+            self._background_cache_dir.mkdir(parents=True, exist_ok=True)
+            self._background_tmp_dir = cache_dir / "background_images_tmp"
+            self._background_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            # 缓存目录分类：avatars / background_images / background_images_tmp
+            target_avatar_dir = cache_dir / "avatars"
+            self.avatar_dir = str(target_avatar_dir)
+            os.makedirs(self.avatar_dir, exist_ok=True)
+
+            # 迁移旧版本缓存目录（插件目录 / 旧 plugin_data 结构 / 旧 fallback 结构）
+            legacy_avatar_dirs = [
+                Path(self.data_dir) / "avatars",
+                plugin_data_dir / "avatars",
+            ]
+            for legacy_dir in legacy_avatar_dirs:
+                self._migrate_legacy_cache_dir(legacy_dir, target_avatar_dir, label="头像")
+
+            legacy_background_dirs = [
+                Path(self.background_dir) / "images",  # 旧 fallback 结构
+                Path(self.data_dir) / "background_images",
+                plugin_data_dir / "background_images",
+            ]
+            for legacy_dir in legacy_background_dirs:
+                self._migrate_legacy_cache_dir(
+                    legacy_dir, self._background_cache_dir, label="背景图"
+                )
+
+            legacy_background_tmp_dirs = [
+                Path(self.background_dir) / "images_tmp",  # 旧 fallback 结构
+                Path(self.data_dir) / "background_images_tmp",
+                plugin_data_dir / "background_images_tmp",
+            ]
+            for legacy_dir in legacy_background_tmp_dirs:
+                self._migrate_legacy_cache_dir(
+                    legacy_dir, self._background_tmp_dir, label="背景图临时"
+                )
+
+            self._storage_initialized = True
+            logger.info(f"插件数据目录初始化完成: {plugin_data_dir}")
+        except Exception as e:
+            # 兼容：若无法获取 AstrBot 数据目录，则回退到插件目录
+            logger.warning(f"初始化插件数据目录失败，将回退到插件目录缓存: {e}")
+            self._plugin_data_dir = Path(self.data_dir)
+
+            cache_dir = self._plugin_data_dir / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            self._background_cache_dir = cache_dir / "background_images"
+            self._background_cache_dir.mkdir(parents=True, exist_ok=True)
+            self._background_tmp_dir = cache_dir / "background_images_tmp"
+            self._background_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            target_avatar_dir = cache_dir / "avatars"
+            self.avatar_dir = str(target_avatar_dir)
+            os.makedirs(self.avatar_dir, exist_ok=True)
+
+            legacy_avatar_dirs = [
+                Path(self.data_dir) / "avatars",
+            ]
+            for legacy_dir in legacy_avatar_dirs:
+                self._migrate_legacy_cache_dir(legacy_dir, target_avatar_dir, label="头像")
+
+            legacy_background_dirs = [
+                Path(self.background_dir) / "images",
+                Path(self.data_dir) / "background_images",
+            ]
+            for legacy_dir in legacy_background_dirs:
+                self._migrate_legacy_cache_dir(
+                    legacy_dir, self._background_cache_dir, label="背景图"
+                )
+
+            legacy_background_tmp_dirs = [
+                Path(self.background_dir) / "images_tmp",
+                Path(self.data_dir) / "background_images_tmp",
+            ]
+            for legacy_dir in legacy_background_tmp_dirs:
+                self._migrate_legacy_cache_dir(
+                    legacy_dir, self._background_tmp_dir, label="背景图临时"
+                )
+
+            self._storage_initialized = True
+
+    def _start_background_precache(self) -> None:
+        """启动后台预缓存任务（不会阻塞插件加载/重载）。"""
+        if self._precache_task and not self._precache_task.done():
+            return
+        self._precache_task = asyncio.create_task(self._pre_cache_background_images())
+
+    def _background_cache_path_for_url(self, url: str) -> Path:
+        self._ensure_storage_dirs()
+        assert self._background_cache_dir is not None
+
+        parsed = urlparse(url)
+        ext = os.path.splitext(parsed.path)[1].lower()
+        if not ext or len(ext) > 10:
+            ext = ".img"
+        digest = sha256(url.encode("utf-8")).hexdigest()
+        return self._background_cache_dir / f"{digest}{ext}"
+
+    def _background_tmp_path_for_url(self, url: str) -> Path:
+        self._ensure_storage_dirs()
+        assert self._background_tmp_dir is not None
+
+        parsed = urlparse(url)
+        ext = os.path.splitext(parsed.path)[1].lower()
+        if not ext or len(ext) > 10:
+            ext = ".img"
+        return self._background_tmp_dir / f"{uuid4().hex}{ext}"
+
+    async def _download_to_path(
+        self, url: str, dest: Path, label: str = "图片", retries: int = 1
+    ) -> bool:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        retries = max(0, int(retries))
+
+        for attempt in range(retries + 1):
+            status: Optional[int] = None
+            reason = ""
+            tmp_path = dest.parent / f"{dest.name}.{uuid4().hex}.tmp"
+
+            try:
+                async with self._session.get(url, headers=self._http_headers) as response:
+                    status = response.status
+                    reason = (response.reason or "").strip()
+
+                    if status < 200 or status >= 300:
+                        # 5xx 可能是临时问题，允许重试；其它状态码直接失败
+                        if 500 <= status <= 599 and attempt < retries:
+                            logger.warning(
+                                f"{label}下载失败({attempt + 1}/{retries + 1}): HTTP {status} {reason} | {url}"
+                            )
+                            continue
+
+                        logger.error(f"{label}下载失败: HTTP {status} {reason} | {url}")
+                        return False
+
+                    # 流式写入，避免一次性读入内存
+                    async with aiofiles.open(tmp_path, "wb") as f:
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            await f.write(chunk)
+
+                await asyncio.to_thread(os.replace, tmp_path, dest)
+                return True
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                http_info = f"HTTP {status} {reason} | " if status is not None else ""
+                if attempt < retries:
+                    logger.warning(
+                        f"{label}下载失败({attempt + 1}/{retries + 1}): {http_info}Timeout | {url}"
+                    )
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+                logger.error(f"{label}下载失败: {http_info}Timeout | {url}")
+            except aiohttp.ClientPayloadError as e:
+                msg = str(e).strip()
+                # 该类错误通常带有较长的内部异常信息，保持简短即可
+                if ":" in msg:
+                    msg = msg.split(":", 1)[0].strip()
+                if len(msg) > 200:
+                    msg = msg[:200] + "..."
+                http_info = f"HTTP {status} {reason} | " if status is not None else ""
+                if attempt < retries:
+                    logger.warning(
+                        f"{label}下载失败({attempt + 1}/{retries + 1}): {http_info}{type(e).__name__}: {msg} | {url}"
+                    )
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+                logger.error(
+                    f"{label}下载失败: {http_info}{type(e).__name__}: {msg} | {url}"
+                )
+            except aiohttp.ClientError as e:
+                msg = str(e).strip()
+                if len(msg) > 200:
+                    msg = msg[:200] + "..."
+                http_info = f"HTTP {status} {reason} | " if status is not None else ""
+                if attempt < retries:
+                    logger.warning(
+                        f"{label}下载失败({attempt + 1}/{retries + 1}): {http_info}{type(e).__name__}: {msg} | {url}"
+                    )
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+                logger.error(
+                    f"{label}下载失败: {http_info}{type(e).__name__}: {msg} | {url}"
+                )
+            except Exception as e:
+                msg = str(e).strip()
+                if len(msg) > 200:
+                    msg = msg[:200] + "..."
+                http_info = f"HTTP {status} {reason} | " if status is not None else ""
+                if attempt < retries:
+                    logger.warning(
+                        f"{label}下载失败({attempt + 1}/{retries + 1}): {http_info}{type(e).__name__}: {msg} | {url}"
+                    )
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+                logger.error(
+                    f"{label}下载失败: {http_info}{type(e).__name__}: {msg} | {url}"
+                )
+            finally:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
+
+        return False
+
+    async def _collect_all_background_urls(self) -> List[str]:
+        background_files = await asyncio.to_thread(
+            lambda: [f for f in os.listdir(self.background_dir) if f.endswith(".txt")]
+        )
+
+        urls: set[str] = set()
+        for background_file in background_files:
+            background_file_path = os.path.join(self.background_dir, background_file)
+            try:
+                async with aiofiles.open(background_file_path, "r", encoding="utf-8") as f:
+                    async for line in f:
+                        url = line.strip()
+                        if not url:
+                            continue
+                        if url.startswith("http://") or url.startswith("https://"):
+                            urls.add(url)
+            except Exception as e:
+                logger.warning(f"读取背景图列表失败: {background_file_path} | {e}")
+
+        return sorted(urls)
+
+    async def _pre_cache_background_images(self) -> None:
+        self._ensure_storage_dirs()
+
+        urls = await self._collect_all_background_urls()
+        total = len(urls)
+        if total == 0:
+            logger.warning("预缓存背景图：未找到任何图片 URL")
+            return
+
+        try:
+            concurrency = int(self.config.get("pre_cache_concurrency", 3))
+        except Exception:
+            concurrency = 3
+        concurrency = max(1, min(concurrency, 10))
+
+        already_cached = 0
+        to_download: List[Tuple[str, Path]] = []
+        for url in urls:
+            dest = self._background_cache_path_for_url(url)
+            if dest.exists():
+                already_cached += 1
+            else:
+                to_download.append((url, dest))
+
+        logger.info(
+            f"预缓存背景图开始: total={total}, cached={already_cached}, download={len(to_download)}, concurrency={concurrency}"
+        )
+
+        if hasattr(self, "put_kv_data"):
+            try:
+                await self.put_kv_data(
+                    "bg_cache_status",
+                    {
+                        "status": "running",
+                        "total": total,
+                        "cached": already_cached,
+                        "download": len(to_download),
+                        "started_at": datetime.now().isoformat(),
+                    },
+                )
+            except Exception as e:
+                logger.warning(f"写入 KV 缓存状态失败: {e}")
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _dl(url: str, dest: Path) -> bool:
+            if dest.exists():
+                return True
+            async with sem:
+                if dest.exists():
+                    return True
+                return await self._download_to_path(url, dest, label="背景图")
+
+        downloaded = 0
+        failed = 0
+        cancelled = False
+        try:
+            results = await asyncio.gather(
+                *(_dl(url, dest) for url, dest in to_download),
+                return_exceptions=True,
+            )
+            for r in results:
+                if r is True:
+                    downloaded += 1
+                else:
+                    # False 或 Exception 都算失败（个别 URL 可能已失效）
+                    failed += 1
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if hasattr(self, "put_kv_data"):
+                try:
+                    await self.put_kv_data(
+                        "bg_cache_status",
+                        {
+                            "status": "cancelled" if cancelled else "done",
+                            "total": total,
+                            "cached": already_cached,
+                            "download": len(to_download),
+                            "downloaded": downloaded,
+                            "failed": failed,
+                            "ended_at": datetime.now().isoformat(),
+                        },
+                    )
+                except Exception as e:
+                    logger.warning(f"写入 KV 缓存状态失败: {e}")
+
+        logger.info(
+            f"预缓存背景图完成: total={total}, cached={already_cached}, downloaded={downloaded}, failed={failed}"
+        )
+
     # 处理器1：指令处理器
     @filter.command("jrys", alias=["今日运势", "运势"])
     async def jrys_command_handler(self, event: AstrMessageEvent):
@@ -122,7 +554,7 @@ class JrysPlugin(Star):
 
     # 处理器2：关键词处理器
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def jrys_keyword_handler(self, event: AstrMessageEvent):
+    async def jrys_keyword_handler(self, event: AstrMessageEvent, *args, **kwargs):
         """处理 jrys, 今日运势, 运势 等关键词"""
 
         # 关键步骤2: 检查事件是否已被指令处理器处理过
@@ -155,6 +587,9 @@ class JrysPlugin(Star):
 
         logger.info(f"正在为用户 {user_name}({user_id}) 生成今日运势")
 
+        background_path = None
+        background_should_cleanup = False
+
         try:
 
             results = await asyncio.gather(
@@ -163,16 +598,28 @@ class JrysPlugin(Star):
                 return_exceptions=True,  # 捕获异常
             )
 
-            avatar_path, background_path = results
+            avatar_path, background_result = results
+
+            if isinstance(background_result, Exception):
+                logger.error(f"获取背景图片时出错: {background_result}")
+                yield event.plain_result("获取背景图片失败，请稍后再试～")
+                return
+
+            if background_result is None:
+                logger.error("获取背景图片失败: 返回为空")
+                yield event.plain_result("获取背景图片失败，请稍后再试～")
+                return
+
+            background_path, background_should_cleanup = background_result
 
             if isinstance(avatar_path, Exception):
                 logger.error(f"获取头像时出错: {avatar_path}")
                 yield event.plain_result("获取头像失败，请稍后再试～")
-                return
-
-            if isinstance(background_path, Exception):
-                logger.error(f"获取背景图片时出错: {background_path}")
-                yield event.plain_result("获取背景图片失败，请稍后再试～")
+                if background_should_cleanup and background_path and os.path.exists(background_path):
+                    try:
+                        await aiofiles.os.remove(background_path)
+                    except Exception:
+                        pass
                 return
 
         except Exception as e:
@@ -218,6 +665,16 @@ class JrysPlugin(Star):
 
                 except Exception as e:
                     logger.warning(f"删除临时文件 {temp_file_path} 失败: {e}")
+
+            if (
+                background_should_cleanup
+                and background_path
+                and os.path.exists(background_path)
+            ):
+                try:
+                    await aiofiles.os.remove(background_path)
+                except Exception:
+                    pass
 
     def _generate_image_sync(
         self, user_id: str, avatar_path: str, background_path: str
@@ -356,7 +813,7 @@ class JrysPlugin(Star):
                 image,
                 text=warning_text,
                 position="center",
-                y=self.warning_text_y,
+                y=warning_text_y,
                 color=(255, 255, 255),
                 font=self.fonts[30],  # 使用30号字体
             )
@@ -416,17 +873,19 @@ class JrysPlugin(Star):
             logger.error(f"文件 {jrys_path} 不是有效的 JSON 格式")
             return {}
 
-    async def get_background_image(self) -> Optional[str]:
+    async def get_background_image(self) -> Optional[Tuple[str, bool]]:
         """
         随机获取背景图片
         1. 在当前目录下的 backgroundFolder 文件夹中查找所有的 txt 文件
         2. 随机选择一个 txt 文件
         3. 从选中的 txt 文件中随机选择一行
         4. 将选中的行作为图片的 URL
-        5.返回图片路径
+        5.返回图片路径，以及是否需要清理
         """
 
         try:
+            self._ensure_storage_dirs()
+
             # 查找所有的 txt 文件
             background_files = await asyncio.to_thread(
                 lambda: [
@@ -451,42 +910,44 @@ class JrysPlugin(Star):
                     logger.warning(f"文件 {background_file} 中没有找到有效的 URL")
                     return None
 
-                # 随机选择一行URL
-                image_url = random.choice(background_urls)
+                # 尝试多个 URL，避免个别链接失效导致整体失败
+                random.shuffle(background_urls)
+                max_attempts = min(5, len(background_urls))
 
-                # 创建图片目录
-                image_dir = os.path.join(self.background_dir, "images")
-                os.makedirs(image_dir, exist_ok=True)
+                pre_cache_enabled = bool(
+                    self.config.get("pre_cache_background_images", False)
+                )
+                cleanup_downloads = bool(
+                    self.config.get("cleanup_background_downloads", True)
+                )
 
-                image_name = os.path.basename(image_url)
-                image_path = os.path.join(image_dir, image_name)
+                for image_url in background_urls[:max_attempts]:
+                    if not (
+                        image_url.startswith("http://")
+                        or image_url.startswith("https://")
+                    ):
+                        continue
 
-                # 检查图片是否存在,如果存在则返回
-                if os.path.exists(image_path):
-                    return image_path
-                # 下载图片
+                    cache_path = self._background_cache_path_for_url(image_url)
 
-                try:
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
-                    }
+                    # 已缓存则直接返回（持久化缓存不做清理）
+                    if cache_path.exists():
+                        return str(cache_path), False
 
-                    async with self._session.get(image_url, headers=headers) as response:
-                        response.raise_for_status()  # 检查请求是否成功
-                        content = await response.read()  # 异步读取响应内容
+                    # 未启用预缓存时：默认按需下载后清理；关闭开关则仍然写入持久化缓存目录
+                    image_path = cache_path
+                    should_cleanup = False
+                    if (not pre_cache_enabled) and cleanup_downloads:
+                        image_path = self._background_tmp_path_for_url(image_url)
+                        should_cleanup = True
 
-                        async with aiofiles.open(image_path, "wb") as f:
-                            await f.write(content)
-
+                    ok = await self._download_to_path(image_url, image_path, label="背景图")
+                    if ok:
                         logger.info(f"下载图片成功: {image_url}")
-                    return image_path
+                        return str(image_path), should_cleanup
 
-                except aiohttp.ClientResponseError as e:
-                    logger.error(f"状态码错误: {e}")
-                    return None
-                except aiohttp.ClientError as e:
-                    logger.error(f"请求错误: {e}")
-                    return None
+                logger.warning(f"背景图下载失败: 已尝试 {max_attempts} 个 URL")
+                return None
 
         except Exception as e:
             logger.error(f"获取背景图片时出错: {e}")
@@ -848,6 +1309,7 @@ class JrysPlugin(Star):
             str: 头像的路径
         """
         try:
+            self._ensure_storage_dirs()
             avatar_path = os.path.join(self.avatar_dir, f"{user_id}.jpg")
             # 检查头像是否存在
             if await aiofiles.os.path.exists(avatar_path):
@@ -868,22 +1330,10 @@ class JrysPlugin(Star):
 
             url = f"http://q.qlogo.cn/g?b=qq&nk={user_id}&s=640"
 
-            try:
-                async with self._session.get(url) as response:
-                    response.raise_for_status()
-                    content = await response.read()  # 异步读取响应内容
-
-                    async with aiofiles.open(os.path.join(avatar_path), "wb") as f:
-                        await f.write(content)
-
-                    return avatar_path
-
-            except aiohttp.ClientResponseError as e:
-                logger.error(f"状态码错误: {e}")
-                return None
-            except aiohttp.ClientError as e:
-                logger.error(f"请求错误: {e}")
-                return None
+            ok = await self._download_to_path(url, Path(avatar_path), label="头像")
+            if ok:
+                return avatar_path
+            return None
 
         except Exception as e:
             logger.error(f"获取用户头像失败: {e}")
@@ -926,6 +1376,15 @@ class JrysPlugin(Star):
 
     async def terminate(self):
         """插件终止时的清理工作"""
+        if self._precache_task and not self._precache_task.done():
+            self._precache_task.cancel()
+            try:
+                await self._precache_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"预缓存任务清理失败: {e}")
+
         if self._session:
             await self._session.close()
             logger.info("HTTP会话已关闭")
